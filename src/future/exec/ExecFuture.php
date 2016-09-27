@@ -19,12 +19,11 @@
  * @task interact Interacting With Commands
  * @task internal Internals
  */
-final class ExecFuture extends Future {
+final class ExecFuture extends PhutilExecutableFuture {
 
   private $pipes        = array();
   private $proc         = null;
   private $start        = null;
-  private $timeout      = null;
   private $procStatus   = null;
 
   private $stdout       = null;
@@ -35,8 +34,6 @@ final class ExecFuture extends Future {
   private $stdoutPos    = 0;
   private $stderrPos    = 0;
   private $command      = null;
-  private $env          = null;
-  private $cwd;
 
   private $readBufferSize;
   private $stdoutSizeLimit = PHP_INT_MAX;
@@ -48,6 +45,10 @@ final class ExecFuture extends Future {
   private $useWindowsFileStreams = false;
   private $windowsStdoutTempFile = null;
   private $windowsStderrTempFile = null;
+
+  private $terminateTimeout;
+  private $didTerminate;
+  private $killTimeout;
 
   private static $descriptorSpec = array(
     0 => array('pipe', 'r'),  // stdin
@@ -176,59 +177,6 @@ final class ExecFuture extends Future {
    */
   public function setReadBufferSize($read_buffer_size) {
     $this->readBufferSize = $read_buffer_size;
-    return $this;
-  }
-
-
-  /**
-   * Set the current working directory to use when executing the command.
-   *
-   * @param string Directory to set as CWD before executing the command.
-   * @return this
-   * @task config
-   */
-  public function setCWD($cwd) {
-    $this->cwd = $cwd;
-    return $this;
-  }
-
-
-  /**
-   * Set the environment variables to use when executing the command.
-   *
-   * @param array Environment variables to use when executing the command.
-   * @return this
-   * @task config
-   */
-  public function setEnv($env, $wipe_process_env = false) {
-    if ($wipe_process_env) {
-      $this->env = $env;
-    } else {
-      $this->env = $env + $_ENV;
-    }
-    return $this;
-  }
-
-
-  /**
-   * Set the value of a specific environmental variable for this command.
-   *
-   * @param string Environmental variable name.
-   * @param string|null New value, or null to remove this variable.
-   * @return this
-   * @task config
-   */
-  public function updateEnv($key, $value) {
-    if (!is_array($this->env)) {
-      $this->env = $_ENV;
-    }
-
-    if ($value === null) {
-      unset($this->env[$key]);
-    } else {
-      $this->env[$key] = $value;
-    }
-
     return $this;
   }
 
@@ -381,15 +329,20 @@ final class ExecFuture extends Future {
 
   /**
    * Set a hard limit on execution time. If the command runs longer, it will
-   * be killed and the future will resolve with an error code. You can test
+   * be terminated and the future will resolve with an error code. You can test
    * if a future was killed by a timeout with @{method:getWasKilledByTimeout}.
    *
-   * @param int Maximum number of seconds this command may execute for.
+   * The subprocess will be sent a `TERM` signal, and then a `KILL` signal a
+   * short while later if it fails to exit.
+   *
+   * @param int Maximum number of seconds this command may execute for before
+   *  it is signaled.
    * @return this
    * @task config
    */
   public function setTimeout($seconds) {
-    $this->timeout = $seconds;
+    $this->terminateTimeout = $seconds;
+    $this->killTimeout = $seconds + min($seconds, 60);
     return $this;
   }
 
@@ -472,13 +425,9 @@ final class ExecFuture extends Future {
    */
   public function resolveKill() {
     if (!$this->result) {
-      if (defined('SIGKILL')) {
-        $signal = SIGKILL;
-      } else {
-        $signal = 9;
-      }
-
+      $signal = 9;
       proc_terminate($this->proc, $signal);
+
       $this->result = array(
         128 + $signal,
         $this->stdout,
@@ -659,25 +608,13 @@ final class ExecFuture extends Future {
         }
       }
 
-
-      // NOTE: Convert all the environmental variables we're going to pass
-      // into strings before we install PhutilErrorTrap. If something in here
-      // is really an object which is going to throw when we try to turn it
-      // into a string, we want the exception to escape here -- not after we
-      // start trapping errors.
-      $env = $this->env;
-      if ($env !== null) {
-        foreach ($env as $key => $value) {
-          $env[$key] = (string)$value;
-        }
-      }
-
-      // Same for the working directory.
-      if ($this->cwd === null) {
-        $cwd = null;
+      if ($this->hasEnv()) {
+        $env = $this->getEnv();
       } else {
-        $cwd = (string)$this->cwd;
+        $env = null;
       }
+
+      $cwd = $this->getCWD();
 
       // NOTE: See note above about Phage.
       if (class_exists('PhutilErrorTrap')) {
@@ -834,8 +771,18 @@ final class ExecFuture extends Future {
         fclose($stderr);
       }
 
+      // If the subprocess got nuked with `kill -9`, we get a -1 exitcode.
+      // Upgrade this to a slightly more informative value by examining the
+      // terminating signal code.
+      $err = $status['exitcode'];
+      if ($err == -1) {
+        if ($status['signaled']) {
+          $err = 128 + $status['termsig'];
+        }
+      }
+
       $this->result = array(
-        $status['exitcode'],
+        $err,
         $this->stdout,
         $this->stderr,
       );
@@ -844,7 +791,16 @@ final class ExecFuture extends Future {
     }
 
     $elapsed = (microtime(true) - $this->start);
-    if ($this->timeout && ($elapsed >= $this->timeout)) {
+
+    if ($this->terminateTimeout && ($elapsed >= $this->terminateTimeout)) {
+      if (!$this->didTerminate) {
+        $this->killedByTimeout = true;
+        $this->sendTerminateSignal();
+        return false;
+      }
+    }
+
+    if ($this->killTimeout && ($elapsed >= $this->killTimeout)) {
       $this->killedByTimeout = true;
       $this->resolveKill();
       return true;
@@ -867,7 +823,10 @@ final class ExecFuture extends Future {
 
     $status = $this->procGetStatus();
     if ($status['running']) {
-      $this->resolveKill();
+      $this->sendTerminateSignal();
+      if (!$this->waitForExit(5)) {
+        $this->resolveKill();
+      }
     } else {
       $this->closeProcess();
     }
@@ -921,6 +880,7 @@ final class ExecFuture extends Future {
       }
     }
     $this->procStatus = proc_get_status($this->proc);
+
     return $this->procStatus;
   }
 
@@ -957,15 +917,46 @@ final class ExecFuture extends Future {
   public function getDefaultWait() {
     $wait = parent::getDefaultWait();
 
-    if ($this->timeout) {
+    $next_timeout = $this->getNextTimeout();
+    if ($next_timeout) {
       if (!$this->start) {
         $this->start = microtime(true);
       }
       $elapsed = (microtime(true) - $this->start);
-      $wait = max(0, min($this->timeout - $elapsed, $wait));
+      $wait = max(0, min($next_timeout - $elapsed, $wait));
     }
 
     return $wait;
+  }
+
+  private function getNextTimeout() {
+    if ($this->didTerminate) {
+      return $this->killTimeout;
+    } else {
+      return $this->terminateTimeout;
+    }
+  }
+
+  private function sendTerminateSignal() {
+    $this->didTerminate = true;
+    proc_terminate($this->proc);
+    return $this;
+  }
+
+  private function waitForExit($duration) {
+    $start = microtime(true);
+
+    while (true) {
+      $status = $this->procGetStatus();
+      if (!$status['running']) {
+        return true;
+      }
+
+      $waited = (microtime(true) - $start);
+      if ($waited > $duration) {
+        return false;
+      }
+    }
   }
 
 }
