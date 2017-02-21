@@ -22,7 +22,7 @@ final class PhutilCalendarRelativeDateTime
     return $this->duration;
   }
 
-  protected function newPHPDateTime() {
+  public function newPHPDateTime() {
     $datetime = parent::newPHPDateTime();
     $duration = $this->getDuration();
 
@@ -48,6 +48,27 @@ final class PhutilCalendarRelativeDateTime
     }
 
     return $datetime;
+  }
+
+  public function newAbsoluteDateTime() {
+    $clone = clone $this;
+
+    if ($clone->getTimezone()) {
+      $clone->setViewerTimezone(null);
+    }
+
+    $datetime = $clone->newPHPDateTime();
+
+    return id(new PhutilCalendarAbsoluteDateTime())
+      ->setYear((int)$datetime->format('Y'))
+      ->setMonth((int)$datetime->format('m'))
+      ->setDay((int)$datetime->format('d'))
+      ->setHour((int)$datetime->format('H'))
+      ->setMinute((int)$datetime->format('i'))
+      ->setSecond((int)$datetime->format('s'))
+      ->setIsAllDay($clone->getIsAllDay())
+      ->setTimezone($clone->getTimezone())
+      ->setViewerTimezone($this->getViewerTimezone());
   }
 
 }
