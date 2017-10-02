@@ -5,6 +5,10 @@ final class PhageExecuteAction
 
   private $command;
   private $label;
+  private $timeout;
+
+  private $exitCode;
+  private $didTimeout;
 
   public function isContainerAction() {
     return false;
@@ -26,6 +30,33 @@ final class PhageExecuteAction
 
   public function getLabel() {
     return $this->label;
+  }
+
+  public function setTimeout($timeout) {
+    $this->timeout = $timeout;
+    return $this;
+  }
+
+  public function getTimeout() {
+    return $this->timeout;
+  }
+
+  public function setExitCode($exit_code) {
+    $this->exitCode = $exit_code;
+    return $this;
+  }
+
+  public function getExitCode() {
+    return $this->exitCode;
+  }
+
+  public function setDidTimeout($did_timeout) {
+    $this->didTimeout = $did_timeout;
+    return $this;
+  }
+
+  public function getDidTimeout() {
+    return $this->didTimeout;
   }
 
 }

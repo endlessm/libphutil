@@ -87,6 +87,57 @@ final class PhutilSearchQueryCompilerTestCase
     $this->assertCompileQueries($stemming_tests, null, $stemmer);
   }
 
+  public function testCompileQueriesWithFunctions() {
+    $op_and = PhutilSearchQueryCompiler::OPERATOR_AND;
+    $op_sub = PhutilSearchQueryCompiler::OPERATOR_SUBSTRING;
+    $op_exact = PhutilSearchQueryCompiler::OPERATOR_EXACT;
+
+    $mao = "\xE7\x8C\xAB";
+
+    $function_tests = array(
+      'cat' => array(
+        array(null, $op_and, 'cat'),
+      ),
+      ':cat' => array(
+        array(null, $op_and, 'cat'),
+      ),
+      'title:cat' => array(
+        array('title', $op_and, 'cat'),
+      ),
+      'title:cat:dog' => array(
+        array('title', $op_and, 'cat:dog'),
+      ),
+      'title:~cat' => array(
+        array('title', $op_sub, 'cat'),
+      ),
+      'cat title:="Meow Meow"' => array(
+        array(null, $op_and, 'cat'),
+        array('title', $op_exact, 'Meow Meow'),
+      ),
+      'title:cat title:dog' => array(
+        array('title', $op_and, 'cat'),
+        array('title', $op_and, 'dog'),
+      ),
+      '~"core and seven years ag"' => array(
+        array(null, $op_sub, 'core and seven years ag'),
+      ),
+      $mao => array(
+        array(null, $op_sub, $mao),
+      ),
+      '+'.$mao => array(
+        array(null, $op_and, $mao),
+      ),
+      '~'.$mao => array(
+        array(null, $op_sub, $mao),
+      ),
+      '"'.$mao.'"' => array(
+        array(null, $op_and, $mao),
+      ),
+    );
+
+    $this->assertCompileFunctionQueries($function_tests);
+  }
+
   private function assertCompileQueries(
     array $tests,
     $operators = null,
@@ -99,8 +150,7 @@ final class PhutilSearchQueryCompilerTestCase
       $stemmed_query = null;
 
       try {
-        $compiler = id(new PhutilSearchQueryCompiler())
-          ->setQuery($input);
+        $compiler = new PhutilSearchQueryCompiler();
 
         if ($operators !== null) {
           $compiler->setOperators($operators);
@@ -110,11 +160,13 @@ final class PhutilSearchQueryCompilerTestCase
           $compiler->setStemmer($stemmer);
         }
 
+        $tokens = $compiler->newTokens($input);
+
         if ($stemmer) {
-          $literal_query = $compiler->compileLiteralQuery();
-          $stemmed_query = $compiler->compileStemmedQuery();
+          $literal_query = $compiler->compileLiteralQuery($tokens);
+          $stemmed_query = $compiler->compileStemmedQuery($tokens);
         } else {
-          $query = $compiler->compileQuery();
+          $query = $compiler->compileQuery($tokens);
         }
       } catch (PhutilSearchQueryCompilerSyntaxException $ex) {
         $caught = $ex;
@@ -139,6 +191,29 @@ final class PhutilSearchQueryCompilerTestCase
             : array($literal_query, $stemmed_query),
           pht('Stemmed compilation of query: %s', $input));
       }
+    }
+  }
+
+  private function assertCompileFunctionQueries(array $tests) {
+    foreach ($tests as $input => $expect) {
+      $compiler = id(new PhutilSearchQueryCompiler())
+        ->setEnableFunctions(true);
+
+      $tokens = $compiler->newTokens($input);
+
+      $result = array();
+      foreach ($tokens as $token) {
+        $result[] = array(
+          $token->getFunction(),
+          $token->getOperator(),
+          $token->getValue(),
+        );
+      }
+
+      $this->assertEqual(
+        $expect,
+        $result,
+        pht('Function compilation of query: %s', $input));
     }
   }
 

@@ -45,6 +45,16 @@ final class PhutilURI extends Phobject {
 
     $type = self::TYPE_URI;
 
+    // Reject ambiguous URIs outright. Different versions of different clients
+    // parse these in different ways. See T12526 for discussion.
+    if (preg_match('(^[^/:]*://[^/]*[#?].*:)', $uri)) {
+      throw new Exception(
+        pht(
+          'Rejecting ambiguous URI "%s". This URI is not formatted or '.
+          'encoded properly.',
+          $uri));
+    }
+
     $matches = null;
     if (preg_match('(^([^/:]*://[^/]*)(\\?.*)\z)', $uri, $matches)) {
       // If the URI is something like `idea://open?file=/path/to/file`, the
@@ -87,11 +97,15 @@ final class PhutilURI extends Phobject {
     }
 
     // NOTE: `parse_url()` is very liberal about host names; fail the parse if
-    // the host looks like garbage.
+    // the host looks like garbage. In particular, we do not allow hosts which
+    // begin with "." or "-". See T12961 for a specific attack which relied on
+    // hosts beginning with "-".
     if ($parts) {
       $host = idx($parts, 'host', '');
-      if (!preg_match('/^([a-zA-Z0-9\\.\\-]*)$/', $host)) {
-        $parts = false;
+      if (strlen($host)) {
+        if (!preg_match('/^[a-zA-Z0-9]+[a-zA-Z0-9\\.\\-]*\z/', $host)) {
+          $parts = false;
+        }
       }
     }
 

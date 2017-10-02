@@ -6,9 +6,12 @@ final class PhutilSearchQueryCompiler
   private $operators = '+ -><()~*:""&|';
   private $query;
   private $stemmer;
+  private $enableFunctions = false;
 
   const OPERATOR_NOT = 'not';
   const OPERATOR_AND = 'and';
+  const OPERATOR_SUBSTRING = 'sub';
+  const OPERATOR_EXACT = 'exact';
 
   public function setOperators($operators) {
     $this->operators = $operators;
@@ -17,15 +20,6 @@ final class PhutilSearchQueryCompiler
 
   public function getOperators() {
     return $this->operators;
-  }
-
-  public function setQuery($query) {
-    $this->query = $query;
-    return $this;
-  }
-
-  public function getQuery() {
-    return $this->query;
   }
 
   public function setStemmer(PhutilSearchStemmer $stemmer) {
@@ -37,9 +31,17 @@ final class PhutilSearchQueryCompiler
     return $this->stemmer;
   }
 
-  public function compileQuery() {
-    $query = $this->getQuery();
-    $tokens = $this->tokenizeQuery($query);
+  public function setEnableFunctions($enable_functions) {
+    $this->enableFunctions = $enable_functions;
+    return $this;
+  }
+
+  public function getEnableFunctions() {
+    return $this->enableFunctions;
+  }
+
+  public function compileQuery(array $tokens) {
+    assert_instances_of($tokens, 'PhutilSearchQueryToken');
 
     $result = array();
     foreach ($tokens as $token) {
@@ -49,13 +51,12 @@ final class PhutilSearchQueryCompiler
     return $this->compileRenderedTokens($result);
   }
 
-  public function compileLiteralQuery() {
-    $query = $this->getQuery();
-    $tokens = $this->tokenizeQuery($query);
+  public function compileLiteralQuery(array $tokens) {
+    assert_instances_of($tokens, 'PhutilSearchQueryToken');
 
     $result = array();
     foreach ($tokens as $token) {
-      if (!$token['quoted']) {
+      if (!$token->isQuoted()) {
         continue;
       }
       $result[] = $this->renderToken($token);
@@ -64,13 +65,12 @@ final class PhutilSearchQueryCompiler
     return $this->compileRenderedTokens($result);
   }
 
-  public function compileStemmedQuery() {
-    $query = $this->getQuery();
-    $tokens = $this->tokenizeQuery($query);
+  public function compileStemmedQuery(array $tokens) {
+    assert_instances_of($tokens, 'PhutilSearchQueryToken');
 
     $result = array();
     foreach ($tokens as $token) {
-      if ($token['quoted']) {
+      if ($token->isQuoted()) {
         continue;
       }
       $result[] = $this->renderToken($token, $this->getStemmer());
@@ -88,6 +88,17 @@ final class PhutilSearchQueryCompiler
     return implode(' ', $list);
   }
 
+  public function newTokens($query) {
+    $results = $this->tokenizeQuery($query);
+
+    $tokens = array();
+    foreach ($results as $result) {
+      $tokens[] = PhutilSearchQueryToken::newFromDictionary($result);
+    }
+
+    return $tokens;
+  }
+
   private function tokenizeQuery($query) {
     $maximum_bytes = 1024;
 
@@ -103,11 +114,21 @@ final class PhutilSearchQueryCompiler
     $query = phutil_utf8v($query);
     $length = count($query);
 
+    $enable_functions = $this->getEnableFunctions();
+
     $mode = 'scan';
     $current_operator = array();
     $current_token = array();
+    $current_function = null;
     $is_quoted = false;
     $tokens = array();
+
+    if ($enable_functions) {
+      $operator_characters = '[~=+-]';
+    } else {
+      $operator_characters = '[+-]';
+    }
+
     for ($ii = 0; $ii < $length; $ii++) {
       $character = $query[$ii];
 
@@ -116,7 +137,36 @@ final class PhutilSearchQueryCompiler
           continue;
         }
 
+        $mode = 'function';
+      }
+
+      if ($mode == 'function') {
         $mode = 'operator';
+
+        if ($enable_functions) {
+          $found = false;
+          for ($jj = $ii; $jj < $length; $jj++) {
+            if (preg_match('/^[a-zA-Z]\z/u', $query[$jj])) {
+              continue;
+            }
+            if ($query[$jj] == ':') {
+              $found = $jj;
+            }
+            break;
+          }
+
+          if ($found !== false) {
+            $function = array_slice($query, $ii, ($jj - $ii));
+            $current_function = implode('', $function);
+
+            if (!strlen($current_function)) {
+              $current_function = null;
+            }
+
+            $ii = $jj;
+            continue;
+          }
+        }
       }
 
       if ($mode == 'operator') {
@@ -124,7 +174,7 @@ final class PhutilSearchQueryCompiler
           continue;
         }
 
-        if (preg_match('/^[+-]\z/', $character)) {
+        if (preg_match('/^'.$operator_characters.'\z/', $character)) {
           $current_operator[] = $character;
           continue;
         }
@@ -165,13 +215,21 @@ final class PhutilSearchQueryCompiler
         }
 
         if ($capture) {
-          $tokens[] = array(
+          $token = array(
             'operator' => $current_operator,
             'quoted' => $was_quoted,
             'value' => $current_token,
           );
+
+          if ($enable_functions) {
+            $token['function'] = $current_function;
+          }
+
+          $tokens[] = $token;
+
           $current_operator = array();
           $current_token = array();
+          $current_function = null;
           continue;
         } else {
           $current_token[] = $character;
@@ -192,11 +250,17 @@ final class PhutilSearchQueryCompiler
           implode('', $current_operator)));
     }
 
-    $tokens[] = array(
+    $token = array(
       'operator' => $current_operator,
       'quoted' => false,
       'value' => $current_token,
     );
+
+    if ($enable_functions) {
+      $token['function'] = $current_function;
+    }
+
+    $tokens[] = $token;
 
     $results = array();
     foreach ($tokens as $token) {
@@ -207,13 +271,31 @@ final class PhutilSearchQueryCompiler
         continue;
       }
 
+      $is_quoted = $token['quoted'];
+
       switch ($operator_string) {
         case '-':
           $operator = self::OPERATOR_NOT;
           break;
-        case '':
+        case '~':
+          $operator = self::OPERATOR_SUBSTRING;
+          break;
+        case '=':
+          $operator = self::OPERATOR_EXACT;
+          break;
         case '+':
           $operator = self::OPERATOR_AND;
+          break;
+        case '':
+          // See T12995. If this query term contains Chinese, Japanese or
+          // Korean characters, treat the term as a substring term by default.
+          // These languages do not separate words with spaces, so the term
+          // search mode is normally useless.
+          if ($enable_functions && !$is_quoted && phutil_utf8_is_cjk($value)) {
+            $operator = self::OPERATOR_SUBSTRING;
+          } else {
+            $operator = self::OPERATOR_AND;
+          }
           break;
         default:
           throw new PhutilSearchQueryCompilerSyntaxException(
@@ -222,27 +304,33 @@ final class PhutilSearchQueryCompiler
               $operator_string));
       }
 
-      $results[] = array(
+      $result = array(
         'operator' => $operator,
-        'quoted' => $token['quoted'],
+        'quoted' => $is_quoted,
         'value' => $value,
       );
+
+      if ($enable_functions) {
+        $result['function'] = $token['function'];
+      }
+
+      $results[] = $result;
     }
 
     return $results;
   }
 
   private function renderToken(
-    array $token,
+    PhutilSearchQueryToken $token,
     PhutilSearchStemmer $stemmer = null) {
-    $value = $token['value'];
+    $value = $token->getValue();
 
     if ($stemmer) {
       $value = $stemmer->stemToken($value);
     }
 
     $value = $this->quoteToken($value);
-    $operator = $token['operator'];
+    $operator = $token->getOperator();
     $prefix = $this->getOperatorPrefix($operator);
 
     $value = $prefix.$value;
@@ -282,6 +370,5 @@ final class PhutilSearchQueryCompiler
 
     return $open_quote.$value.$close_quote;
   }
-
 
 }
