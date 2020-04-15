@@ -14,7 +14,7 @@ final class PhutilGoogleAuthAdapter extends PhutilOAuthAuthAdapter {
   }
 
   public function getAccountID() {
-    return $this->getAccountEmail();
+    return $this->getOAuthAccountData('id');
   }
 
   public function getAccountEmail() {
